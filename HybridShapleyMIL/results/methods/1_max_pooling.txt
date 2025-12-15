@@ -1,0 +1,4 @@
+=== MAX POOLING (EfficientNet-B0) ===
+AUC: 0.5487
+Accuracy: 0.5163
+Total slides: 215
