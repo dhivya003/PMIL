@@ -1,5 +1,5 @@
 # ============================================================
-# PMIL SINGLE WSI TESTING + PREDICTED CANCER HEATMAP
+# test_pmil.py — Modified for Flask integration with heatmap
 # ============================================================
 
 import os
@@ -11,48 +11,29 @@ import openslide
 import torchvision.transforms as T
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for Flask
 import matplotlib.pyplot as plt
 
 # ============================================================
-# PATHS (EDIT)
+# CONFIGURATION
 # ============================================================
-
-WSI_PATH   = r"E:\FYP\HybridShapleyMIL\dataset\tumor\tumor4\tumor_085.tif"
-MODEL_PATH = r"E:\FYP\HybridShapleyMIL\models\pmil_combined_5fold.pth"
-#MODEL_PATH = r"E:\FYP\HybridShapleyMIL\models\pmil_fold2.pth"
-LOG_ROOT   = r"E:\FYP\HybridShapleyMIL\test\test_logs"
 
 PATCH_SIZE = 256
 STEP_SIZE  = 256
 LEVEL      = 0
-
-VIS_SCALE   = 32     # downsample for visualization
-TOP_PERCENT = 5      # top % patches used for heatmap
-
-# ============================================================
-# DEVICE
-# ============================================================
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+VIS_SCALE  = 32
+TOP_PERCENT = 5
 
 # ============================================================
-# OUTPUT DIRECTORY
-# ============================================================
-
-slide_id = os.path.splitext(os.path.basename(WSI_PATH))[0]
-SLIDE_LOG_DIR = os.path.join(LOG_ROOT, slide_id)
-os.makedirs(SLIDE_LOG_DIR, exist_ok=True)
-
-# ============================================================
-# PMIL MODEL (IDENTICAL TO TRAINING)
+# PMIL MODEL
 # ============================================================
 
 class PMILHybrid(nn.Module):
     def __init__(self, feat_dim=1280):
         super().__init__()
         self.attention_V = nn.Linear(feat_dim, 128)
-        self.attention_U = nn.Linear(128, 1)     # ✅ FIXED
+        self.attention_U = nn.Linear(128, 1)
         self.classifier = nn.Linear(feat_dim, 2)
 
     def forward(self, x):
@@ -69,7 +50,7 @@ class PMILHybrid(nn.Module):
         return logits, A
 
 # ============================================================
-# STEP 1: PATCH COORDINATE EXTRACTION (TISSUE ONLY)
+# HELPER FUNCTIONS
 # ============================================================
 
 def extract_coords_ultra_fast(slide_path):
@@ -92,10 +73,6 @@ def extract_coords_ultra_fast(slide_path):
     slide.close()
     return coords
 
-# ============================================================
-# STEP 2: FEATURE EXTRACTION (EFFICIENTNET-B0)
-# ============================================================
-
 transform = T.Compose([
     T.ToPILImage(),
     T.Resize(256),
@@ -105,14 +82,13 @@ transform = T.Compose([
                 std=[0.229, 0.224, 0.225]),
 ])
 
-# clean, warning-free loading
-backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
-backbone.classifier = nn.Identity()
-backbone = backbone.to(device)
-backbone.eval()
-
 @torch.no_grad()
-def extract_features(slide_path, coords):
+def extract_features(slide_path, coords, device):
+    backbone = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+    backbone.classifier = nn.Identity()
+    backbone = backbone.to(device)
+    backbone.eval()
+    
     slide = openslide.OpenSlide(slide_path)
     feats = []
 
@@ -126,13 +102,9 @@ def extract_features(slide_path, coords):
     slide.close()
     return torch.cat(feats, dim=0)
 
-# ============================================================
-# STEP 3: PMIL INFERENCE
-# ============================================================
-
-def predict_slide(features):
+def predict_slide(features, model_path, device):
     model = PMILHybrid().to(device)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
     with torch.no_grad():
@@ -148,11 +120,8 @@ def predict_slide(features):
         "attention": attention.cpu().numpy()
     }
 
-# ============================================================
-# STEP 4: VISUALIZE PREDICTED CANCER REGIONS
-# ============================================================
-
-def visualize_predicted_heatmap(wsi_path, coords, attention):
+def visualize_predicted_heatmap(wsi_path, coords, attention, output_path):
+    """Generate heatmap and save to output_path"""
     slide = openslide.OpenSlide(wsi_path)
     w, h = slide.dimensions
 
@@ -176,73 +145,66 @@ def visualize_predicted_heatmap(wsi_path, coords, attention):
             overlay,
             (vx, vy),
             (vx + vps, vy + vps),
-            (255, 0, 0),   # 🔴 predicted cancer
+            (255, 0, 0),
             -1
         )
         canvas = cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0)
 
-    out_path = os.path.join(SLIDE_LOG_DIR, "predicted_attention-heatmap-tumor085.png")
-
     plt.figure(figsize=(12, 12))
     plt.imshow(canvas)
-    plt.title("PMIL Predicted Cancer Regions")
+    plt.title("PMIL Predicted Cancer Regions", fontsize=16, fontweight='bold')
     plt.axis("off")
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.show()
-
-    print(f"✓ Predicted heatmap saved to:\n{out_path}")
-
-# ============================================================
-# SAVE LOG
-# ============================================================
-
-def save_prediction_log(result, num_patches):
-    log_path = os.path.join(SLIDE_LOG_DIR, "prediction.txt")
-    with open(log_path, "w") as f:
-        f.write("="*70 + "\n")
-        f.write("PMIL SINGLE WSI TEST RESULT\n")
-        f.write("="*70 + "\n\n")
-        f.write(f"Slide: {slide_id}.tif\n")
-        f.write(f"Prediction: {result['prediction']}\n")
-        f.write(f"Confidence: {result['confidence']*100:.2f}%\n")
-        f.write(f"Prob Cancer: {result['prob_cancer']*100:.2f}%\n")
-        f.write(f"Prob Non-Cancer: {result['prob_non_cancer']*100:.2f}%\n")
-        f.write(f"Total patches: {num_patches}\n")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
 
 # ============================================================
-# MAIN
+# MAIN FUNCTION FOR FLASK
 # ============================================================
 
-def main():
-    print("\n" + "="*70)
-    print("PMIL SINGLE WSI TESTING + HEATMAP")
-    print("="*70)
-
-    print("\n[1] Extracting patch coordinates...")
-    coords = extract_coords_ultra_fast(WSI_PATH)
-    print(f"✓ {len(coords)} tissue patches")
-
-    print("\n[2] Extracting features...")
-    features = extract_features(WSI_PATH, coords)
-
-    print("\n[3] Running PMIL inference...")
-    result = predict_slide(features)
-
-    save_prediction_log(result, len(coords))
-
-    print("\nFINAL PREDICTION")
-    print(f"Slide: {slide_id}.tif")
-    print(f"Prediction: {result['prediction']}")
-    print(f"Confidence: {result['confidence']*100:.2f}%")
-
+def run_single_wsi_test(wsi_path, model_path=None, output_dir="outputs"):
+    """
+    Main function called by Flask app
+    
+    Args:
+        wsi_path: Path to the WSI file
+        model_path: Path to the trained model (optional, uses default if None)
+        output_dir: Directory to save heatmap
+        
+    Returns:
+        dict with prediction, confidence, probabilities, and heatmap path
+    """
+    # Default model path
+    if model_path is None:
+        model_path = r"E:\FYP\HybridShapleyMIL\models\pmil_fold0.pth"
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Extract slide ID
+    slide_id = os.path.splitext(os.path.basename(wsi_path))[0]
+    
+    # Extract coordinates
+    print(f"Extracting patch coordinates from {slide_id}...")
+    coords = extract_coords_ultra_fast(wsi_path)
+    print(f"Found {len(coords)} tissue patches")
+    
+    # Extract features
+    print("Extracting features...")
+    features = extract_features(wsi_path, coords, device)
+    
+    # Run prediction
+    print("Running PMIL inference...")
+    result = predict_slide(features, model_path, device)
+    result["num_patches"] = len(coords)
+    
+    # Generate heatmap if cancer detected
+    heatmap_path = None
     if result["prediction"] == "CANCER":
-        print("\n[4] Visualizing predicted cancer regions...")
-        visualize_predicted_heatmap(WSI_PATH, coords, result["attention"])
-    else:
-        print("\nSlide predicted NON-CANCER — heatmap skipped")
-
-    print("\n✓ Testing completed successfully")
-    print("="*70)
-
-if __name__ == "__main__":
-    main()
+        print("Generating heatmap...")
+        os.makedirs(output_dir, exist_ok=True)
+        heatmap_path = os.path.join(output_dir, f"{slide_id}_heatmap.png")
+        visualize_predicted_heatmap(wsi_path, coords, result["attention"], heatmap_path)
+        result["heatmap_path"] = heatmap_path
+        print(f"Heatmap saved to {heatmap_path}")
+    
+    return result
